@@ -11,4 +11,5 @@ sqlalchemy
 python-dotenv
 requests
 pytz
+colorama
 python-telegram-bot==20.3
