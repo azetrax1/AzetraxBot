@@ -1,0 +1,13 @@
+ccxt
+pandas
+numpy
+ta
+scikit-learn
+lightgbm
+websocket-client
+uvicorn
+fastapi
+sqlalchemy
+python-dotenv
+requests
+pytz
