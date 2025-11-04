@@ -11,3 +11,4 @@ sqlalchemy
 python-dotenv
 requests
 pytz
+python-telegram-bot==20.3

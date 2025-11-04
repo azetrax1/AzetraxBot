@@ -1,147 +1,77 @@
-import os
-import sys
-import subprocess
-import time
-import requests
+import ccxt
+import asyncio
 import pandas as pd
-import numpy as np
-from datetime import datetime
-from pathlib import Path
+import json
+import time
+from colorama import Fore, Style
+from strategies.rsi_macd import rsi_macd_signal
+from strategies.volume_analyzer import volume_signal
+from strategies.trend_detector import trend_signal
+from strategies.combined_signal import combine_signals
+from telegram_alert import send_telegram
 
-# ====== OTO SANAL ORTAM KURULUMU ======
-venv_path = Path("venv")
+# Config dosyasını oku
+with open("config.json", "r") as f:
+    config = json.load(f)
 
-def ensure_virtualenv():
-    """Venv yoksa oluşturur ve gerekli kütüphaneleri yükler."""
-    if not venv_path.exists():
-        print("🔧 Sanal ortam (venv) oluşturuluyor...")
-        subprocess.check_call([sys.executable, "-m", "venv", "venv"])
-        print("✅ Sanal ortam oluşturuldu.")
+exchange = getattr(ccxt, config["exchange"])()
 
-    # Windows'ta aktif hale getirme komutu
-    if os.name == "nt":
-        python_path = venv_path / "Scripts" / "python.exe"
-        pip_path = venv_path / "Scripts" / "pip.exe"
-    else:
-        python_path = venv_path / "bin" / "python"
-        pip_path = venv_path / "bin" / "pip"
+# 🔹 Binance'teki tüm USDT paritelerini al
+def get_usdt_pairs():
+    markets = exchange.load_markets()
+    usdt_pairs = [symbol for symbol in markets if symbol.endswith("/USDT")]
+    return usdt_pairs
 
-    # Gerekli kütüphaneler
-    required = ["python-binance", "pandas", "numpy", "requests", "matplotlib"]
-    for pkg in required:
-        subprocess.check_call([str(pip_path), "install", pkg])
-
-    print("✅ Gerekli kütüphaneler yüklendi.")
-    return python_path
-
-
-# Eğer aktif ortam değilse, otomatik yeniden çalıştır
-if not hasattr(sys, 'real_prefix') and not (venv_path / "Scripts").exists():
-    python_path = ensure_virtualenv()
-    print("🚀 Bot, sanal ortam içinde yeniden başlatılıyor...")
-    subprocess.check_call([str(python_path), __file__])
-    sys.exit(0)
-
-
-# ====== BİNANCE ANALİZ BOTU ======
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
-
-# 🔑 KENDİ BİLGİLERİNİ BURAYA GİR
-API_KEY = "BINANCE_API_KEYIN"
-API_SECRET = "BINANCE_SECRET_KEYIN"
-TELEGRAM_TOKEN = "TELEGRAM_BOT_TOKENIN"
-CHAT_ID = "TELEGRAM_CHAT_IDIN"
-
-TIMEFRAME = "15m"
-LIMIT = 500
-CHECK_INTERVAL = 60
-
-client = Client(API_KEY, API_SECRET)
-
-# ====== TELEGRAM BİLDİRİM ======
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
+# 🔹 Veri çekme
+def fetch_data(symbol):
     try:
-        requests.post(url, data=payload)
-    except Exception as e:
-        print(f"Telegram hatası: {e}")
-
-
-# ====== TEKNİK ANALİZ ======
-def get_klines(symbol, interval, limit):
-    try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(klines, columns=[
-            'time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
-        ])
-        df['close'] = df['close'].astype(float)
-        df['open'] = df['open'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        df['volume'] = df['volume'].astype(float)
+        bars = exchange.fetch_ohlcv(symbol, timeframe=config["timeframe"], limit=100)
+        df = pd.DataFrame(bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
         return df
-    except BinanceAPIException as e:
-        print(f"{symbol} verisi alınamadı: {e}")
+    except Exception as e:
+        print(Fore.RED + f"{symbol} verisi alınamadı: {e}" + Style.RESET_ALL)
         return None
 
+# 🔹 Tek parite analizi
+async def analyze(symbol):
+    df = fetch_data(symbol)
+    if df is None or df.empty:
+        return
 
-def calculate_rsi(data, period=14):
-    delta = data['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    rsi_macd = rsi_macd_signal(df, config["rsi_period"], config["macd_fast"], config["macd_slow"], config["macd_signal"])
+    volume = volume_signal(df, config["volume_window"])
+    trend = trend_signal(df)
+    combined = combine_signals(rsi_macd, volume, trend)
 
-
-def calculate_macd(data):
-    ema12 = data['close'].ewm(span=12, adjust=False).mean()
-    ema26 = data['close'].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return macd, signal
-
-
-def analyze_symbol(symbol):
-    df = get_klines(symbol, TIMEFRAME, LIMIT)
-    if df is None or len(df) < 50:
-        return None
-
-    df['rsi'] = calculate_rsi(df)
-    df['macd'], df['signal'] = calculate_macd(df)
-
-    rsi = df['rsi'].iloc[-1]
-    macd = df['macd'].iloc[-1]
-    signal = df['signal'].iloc[-1]
-
-    if rsi < 30 and macd > signal:
-        return f"📈 STRONG BUY sinyali! {symbol} RSI={rsi:.2f}"
-    elif rsi > 70 and macd < signal:
-        return f"📉 STRONG SELL sinyali! {symbol} RSI={rsi:.2f}"
-    return None
-
-
-def get_all_symbols():
-    tickers = client.get_all_tickers()
-    return [t['symbol'] for t in tickers if t['symbol'].endswith('USDT')]
-
-
-def main():
-    symbols = get_all_symbols()
-    print(f"{len(symbols)} adet USDT paritesi taranacak...")
+    color = Fore.GREEN if "BUY" in combined else Fore.RED if "SELL" in combined else Fore.YELLOW
+    print(f"{color}{symbol:<12} | RSI-MACD: {rsi_macd:<5} | Volume: {volume:<12} | Trend: {trend:<9} | Signal: {combined}{Style.RESET_ALL}")
+    if "BUY" in combined or "SELL" in combined:
+        if "STRONG BUY" in combined or "STRONG SELL" in combined:
+            message = f"{symbol} | Sinyal: {combined} | Trend: {trend} | Hacim: {volume} | RSİ_MACD: {rsi_macd}"
+            send_telegram(message)
+    
+# 🔹 Ana döngü
+async def main():
+    print(Fore.CYAN + "\n🚀 Binance Piyasa Taraması Başladı (Tüm USDT Çiftleri)...\n" + Style.RESET_ALL)
+    usdt_pairs = get_usdt_pairs()
+    print(Fore.MAGENTA + f"Toplam {len(usdt_pairs)} parite bulundu.\n" + Style.RESET_ALL)
+    await asyncio.sleep(2)
 
     while True:
-        for symbol in symbols:
-            signal = analyze_symbol(symbol)
-            if signal:
-                print(signal)
-                send_telegram_message(signal)
-        print("Tüm pariteler tarandı. Yeniden tarama bekleniyor...")
-        time.sleep(CHECK_INTERVAL)
-
+        batch_size = 10  # Aynı anda analiz edilecek parite sayısı
+        for i in range(0, len(usdt_pairs), batch_size):
+            batch = usdt_pairs[i:i + batch_size]
+            tasks = [analyze(symbol) for symbol in batch]
+            await asyncio.gather(*tasks)
+            print(Fore.WHITE + f"\n--- {i+len(batch)} / {len(usdt_pairs)} parite tarandı ---\n" + Style.RESET_ALL)
+            await asyncio.sleep(1)
+        print(Fore.MAGENTA + "\n⏳ 60 saniye bekleniyor, döngü yeniden başlatılacak...\n" + Style.RESET_ALL)
+        await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    print("🚀 Advenge Analyzer başlatılıyor...")
-    main()
+    asyncio.run(main())
+
+from telegram_alert import send_telegram
+...
+
+
