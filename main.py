@@ -19,7 +19,11 @@ exchange = getattr(ccxt, config["exchange"])()
 # 🔹 Binance'teki tüm USDT paritelerini al
 def get_usdt_pairs():
     markets = exchange.load_markets()
-    usdt_pairs = [symbol for symbol in markets if symbol.endswith("/USDT")]
+    exclude_pairs = ["USDS/USDT", "USDSB/USDT"]
+    usdt_pairs = [
+        symbol for symbol in markets
+        if symbol.endswith("/USDT") and symbol not in exclude_pairs
+    ]
     return usdt_pairs
 
 # 🔹 Veri çekme
